@@ -184,8 +184,7 @@ void StereoFractionalDecimator<T>::initializeFilters() {
 
     // TODO: make it adjustable
     // Deemphasis time constant (50 microseconds)
-    double tau = 50e-6;
-    deemph_alpha = exp(-(1.0 / inputSampleRate) / tau);
+    deemph_alpha = exp(-(1.0 / inputSampleRate) / deemph_tau);
     deemph_state_L = 0.0;
     deemph_state_R = 0.0;
 
@@ -234,14 +233,14 @@ void StereoFractionalDecimator<T>::initializeFilters() {
 }
 
 template <typename T>
-StereoFractionalDecimator<T>::StereoFractionalDecimator(float rateMPX, float rate, unsigned int num_poly_points, FirFilter<T, float> *filter):
+StereoFractionalDecimator<T>::StereoFractionalDecimator(float rateMPX, float rate, float tau, unsigned int num_poly_points, FirFilter<T, float> *filter):
     num_poly_points(num_poly_points &~ 1),
     inputSampleRate(rateMPX), outputSampleRate(rateMPX),
     rate(rate),
+    deemph_tau(tau),
     filter(nullptr)
 {
     try {
-
         initializeFilters();
 
         delay_enabled = true;
