@@ -159,28 +159,27 @@ template <typename T>
 void StereoFractionalDecimator<T>::initializeFilters() {
     std::lock_guard<std::mutex> lock(this->processMutex);
 
-    filter_19k = new BiquadFilter();
-    notch_19k = new NotchFilter();
-    notch_38k = new NotchFilter();
-    filter_hp = new BiquadFilter();
-    filter_lp_lr = new MultistageFilter();
+    filter_19k     = new BiquadFilter();
+    filter_lp_lr   = new MultistageFilter();
     filter_lp_mono = new MultistageFilter();
-    
-    pilot_pll = new PilotPLL(inputSampleRate);
 
-    // 19kHz pilot tone bandpass filter (Q = 1000)
+    pilot_pll = new PilotPLL(inputSampleRate);   // kept for potential future use; not used on the audio path
+
+    // 19 kHz pilot bandpass — feeds the squaring-based 38 kHz reference generator.
+    // High Q (=1000, BW ≈ 19 Hz) keeps the pilot extraction extremely narrow so that
+    // squaring it yields a near-noiseless 38 kHz reference.
     filter_19k->setBandpass2(19000.0, 1000.0, inputSampleRate);
-    
-    // Notch filters to remove pilot and carrier from audio (0 = 50)
-    notch_19k->setNotch(19000.0, 50.0, inputSampleRate);  // Remove 19kHz pilot from mono
-    notch_38k->setNotch(38000.0, 50.0, inputSampleRate);  // Remove 38kHz carrier from L-R
 
-    // High-pass filter for DC removal (~10Hz cutoff)
-    filter_hp->setHighpass(10.0, inputSampleRate);
-
-    // Multi-stage low-pass filters for audio (15kHz cutoff, 8th order)
-    filter_lp_lr->setLowpass(15000.0, inputSampleRate, 8);
-    filter_lp_mono->setLowpass(15000.0, inputSampleRate, 8);
+    // Identical 15 kHz LP @ 16th order on both mono and L-R paths so that magnitude
+    // and group delay match exactly across the audio band — the key for clean
+    // stereo separation. The 16th-order Butterworth gives:
+    //    ~−33 dB at 19 kHz  (pilot residue → effectively inaudible)
+    //    ~−59 dB at 23 kHz  (lower L-R subcarrier sideband — main crosstalk source at 8th order)
+    //    ~−143 dB at 38 kHz (subcarrier centre)
+    // The extra 4 biquads per path are cheap on modern CPUs and give a roughly 30 dB
+    // improvement in stop-band rejection over the 8th-order baseline.
+    filter_lp_lr  ->setLowpass(15000.0, inputSampleRate, 16);
+    filter_lp_mono->setLowpass(15000.0, inputSampleRate, 16);
 
     // TODO: make it adjustable
     // Deemphasis time constant (50 microseconds)
@@ -188,46 +187,37 @@ void StereoFractionalDecimator<T>::initializeFilters() {
     deemph_state_L = 0.0;
     deemph_state_R = 0.0;
 
-    // ==================================================================================
-    carrier_leak_i = 0.0;
-    leak_alpha = 0.001; // 0.001
+    // Slow per-channel DC blocker (~3 Hz) — protects against tiny carrier bias.
+    left_dc_offset = right_dc_offset = 0.0;
+    balance_alpha  = 0.0001;
 
-    // Channel balance correction
-    left_dc_offset = right_dc_offset = 0.0;   // DC offset tracking
-    left_gain_correction = right_gain_correction = 1.0;  // Gain imbalance correction 1.0
-    balance_alpha = 0.0001;                     // Balance adaptation rate, 0.0001
-    left_energy = right_energy = 0.0;        // Channel energy tracking
+    // Forced stereo: always treat the signal as present.
+    signal_present = true;
 
-    signal_level = 0.0;
-    noise_floor = 0.01;
-    gate_threshold = 0.001;
-    gate_alpha = 0.0001;
-    signal_present = false;
-    lr_gain_correction = 2.5;
-    lr_gain_alpha = 0.00001;
-    mono_rms = lr_rms = 0.0;
+    // Standard MPX assumption — adjustable at runtime via setStereoFactor() if needed.
+    stereo_factor = 2.0;
 
-    // Direct crosstalk cancellation
-    left_to_right_leak = right_to_left_leak = 0.0;  // Measured crosstalk coefficients
-    crosstalk_alpha = 0.0001;                   // Crosstalk adaptation rate
-    left_reference = right_reference = 0.0;   // Reference signals for crosstalk measurement
-    
-    // ==================================================================================
+    // Squaring-based 38 kHz reference generator — ~100 ms time constant for the
+    // pilot-DC tracker. Slow enough not to ride the 38 kHz oscillation, fast
+    // enough to follow real envelope changes (e.g. fading SDR signals).
+    pilot_dc_track = 0.0;
+    pilot_dc_alpha = 1.0 - std::exp(-1.0 / (inputSampleRate * 0.1));
 
-    delay_index = 0;
+    // Quadrature pilot via fractional delay: π/2 phase shift @ 19 kHz corresponds to
+    // exactly fs / (4·19000) samples. We split into integer + fractional parts and
+    // interpolate linearly between two history samples.
+    double quad_delay_samples = inputSampleRate / (4.0 * 19000.0);
+    quad_delay_int  = static_cast<size_t>(std::floor(quad_delay_samples));
+    quad_delay_frac = quad_delay_samples - quad_delay_int;
+    pilot_history_idx = 0;
+    for (size_t i = 0; i < PILOT_HISTORY_LEN; ++i) pilot_history[i] = 0.0;
 
-    // Setup delay compensation for phase alignment
-    // The pilot processing chain introduces delay, compensate mono path
-    delay_samples = 16;  // Empirically determined for phase alignment
-    if (delay_samples > MAX_DELAY_SAMPLES) {
-        delay_samples = MAX_DELAY_SAMPLES;
-    }
-    
-    // Initialize delay lines to zero
-    for (size_t i = 0; i < MAX_DELAY_SAMPLES; ++i) {
-        lr_delay_line[i] = 0.0;
-        mono_delay_line[i] = 0.0;
-    }
+    // Default to sin-form reference (90° offset) — this matches the standard FCC/EBU
+    // FM-stereo MPX where the L-R subcarrier is (L−R)·sin(2ωt). For non-standard
+    // transmitters that use the cos convention call setSubcarrierPhase(0.0).
+    subcarrier_phase_rad = M_PI / 2.0;
+    subcarrier_phase_cos = 0.0;
+    subcarrier_phase_sin = 1.0;
 
     initializedFilters_ = true;
 }
@@ -243,7 +233,6 @@ StereoFractionalDecimator<T>::StereoFractionalDecimator(float rateMPX, float rat
     try {
         initializeFilters();
 
-        delay_enabled = true;
         pilot_strength = 0.0;
         stereo_threshold = 0.005;
 
@@ -265,27 +254,13 @@ StereoFractionalDecimator<T>::~StereoFractionalDecimator() {
     delete denomImmutable;
 
     delete filter_19k;
-    delete notch_19k;
-    delete notch_38k;
-    delete filter_hp;
     delete filter_lp_lr;
     delete filter_lp_mono;
     delete pilot_pll;
 
     deemph_state_L = deemph_state_R = 0.0;
-    delay_index = 0;
-
-    carrier_leak_i = 0.0;
     pilot_strength = 0.0;
     left_dc_offset = right_dc_offset = 0.0;
-    left_gain_correction = right_gain_correction = 1.0;
-    left_energy = right_energy = 0.0;
-
-    // Clear delay lines
-    for (size_t i = 0; i < MAX_DELAY_SAMPLES; ++i) {
-        lr_delay_line[i] = 0.0;
-        mono_delay_line[i] = 0.0;
-    }
 }
 
 template <typename T>
@@ -321,224 +296,134 @@ void StereoFractionalDecimator<T>::process() {
 
     if(leftCanProcess)
     {
-        std::vector<double> input_fm(available_samples);
-        
-        for(size_t i = 0; i < available_samples; i++) {
-            input_fm[i] = input[i];
-        }
-
-        std::vector<T> input_left(available_samples);
-        std::vector<T> input_right(available_samples);
-        size_t i_left = 0;
-        size_t i_right = 0;
-
         if(!initializedFilters_){
             printf("StereoFractionalDecimator::process - Filters not initialized!\n");
             std::terminate();
         }
 
-        double stereo_factor = 0.5;
-        std::vector<double> raw_left_output(available_samples);
-        std::vector<double> raw_right_output(available_samples);
-        std::vector<double> test_lp15k_output(available_samples);
-        std::vector<double> test_lmr_filtered_output(available_samples);
-
-        for(size_t i = 0; i < available_samples; i++) {
-
-            // FM demodulation to get MPX signal
-            double mpx_signal = input_fm[i];
-
-            // Extract 19kHz pilot tone with wider bandwidth for PLL
-            double pilot_19k = filter_19k->process(mpx_signal);
-
-            // Generate phase-coherent 38kHz carrier using PLL
-            double coherent_38k = pilot_pll->process(pilot_19k, pilot_strength);
-
-            double lr_signal = mpx_signal * coherent_38k;
-
-            // Extract L+R signal (mono) with phase-matched filtering
-            double mono_raw = filter_lp_mono->process(mpx_signal);
-            double mono_clean = notch_19k->process(mono_raw);
-
-            // Apply stereo factor only if pilot is present
-            double stereo_blend = (pilot_strength > stereo_threshold) ? stereo_factor : 0.0;
-            lr_signal *= stereo_blend;
-
-            // Remove 38kHz carrier residue from L-R signal
-            lr_signal = notch_38k->process(lr_signal);
-
-            double lr_filtered = filter_lp_lr->process(lr_signal);
-            
-            // Track L-R RMS
-            lr_rms += lr_gain_alpha * (lr_filtered * lr_filtered - lr_rms);
-
-            // Adaptive L-R gain correction to match mono level
-            // The L-R signal should be roughly the same amplitude as mono for proper stereo
-            if (mono_rms > 1e-6 && lr_rms > 1e-8 && signal_present) {
-                double target_ratio = 1.0;  // L-R should be comparable to mono
-                double current_ratio = sqrt(lr_rms / mono_rms);
-                
-                if (current_ratio < 0.3) {  // L-R is too quiet
-                    lr_gain_correction += lr_gain_alpha * 100.0 * (target_ratio - current_ratio);
-                } else if (current_ratio > 1.5) {  // L-R is too loud
-                    lr_gain_correction -= lr_gain_alpha * 100.0 * (current_ratio - target_ratio);
-                }
-                
-                // Limit gain correction range
-                if (lr_gain_correction < 1.0) lr_gain_correction = 1.0;
-                if (lr_gain_correction > 4.0) lr_gain_correction = 4.0;
-            }
-            
-            // Apply adaptive gain to L-R signal
-            lr_filtered *= lr_gain_correction;
-            
-            // Apply delay compensation for phase alignment
-            lr_delay_line[delay_index] = lr_filtered;
-            size_t delayed_index = (delay_index + delay_samples - 1) % delay_samples;
-            double lr_compensated = lr_delay_line[delayed_index];
-            
-            mono_delay_line[delay_index] = mono_clean;
-            double mono_compensated = mono_delay_line[delayed_index];
-            
-            delay_index = (delay_index + 1) % delay_samples;
-
-            // Matrix to stereo channels with improved separation, swaped
-            double left_raw = mono_compensated + lr_compensated;
-            double right_raw = mono_compensated - lr_compensated;
-
-            // Store reference signals before any processing
-            left_reference = left_raw;
-            right_reference = right_raw;
-            
-            // Adaptive DC offset removal
-            left_dc_offset += balance_alpha * (left_raw - left_dc_offset);
-            right_dc_offset += balance_alpha * (right_raw - right_dc_offset);
-            left_raw -= left_dc_offset;
-            right_raw -= right_dc_offset;
-            
-            // Track channel energies for balance detection
-            left_energy += balance_alpha * (left_raw * left_raw - left_energy);
-            right_energy += balance_alpha * (right_raw * right_raw - right_energy);
-
-            // Direct crosstalk measurement and cancellation
-            // When right is dominant, measure left channel content as crosstalk
-            if (right_energy > 4.0 * left_energy && right_energy > 0.001) {
-                // Right dominant - left signal is mostly crosstalk
-                double crosstalk_error = left_raw;
-                right_to_left_leak += crosstalk_alpha * (crosstalk_error - right_to_left_leak * right_reference);
-                
-                // Limit crosstalk coefficient
-                if (right_to_left_leak > 0.5) right_to_left_leak = 0.5;
-                if (right_to_left_leak < -0.5) right_to_left_leak = -0.5;
-            }
-            
-            // When left is dominant, measure right channel content as crosstalk  
-            if (left_energy > 4.0 * right_energy && left_energy > 0.001) {
-                // Left dominant - right signal is mostly crosstalk
-                double crosstalk_error = right_raw;
-                left_to_right_leak += crosstalk_alpha * (crosstalk_error - left_to_right_leak * left_reference);
-                
-                // Limit crosstalk coefficient
-                if (left_to_right_leak > 0.5) left_to_right_leak = 0.5;
-                if (left_to_right_leak < -0.5) left_to_right_leak = -0.5;
-            }
-
-            // Apply crosstalk cancellation
-            left_raw -= right_to_left_leak * right_reference;
-            right_raw -= left_to_right_leak * left_reference;
-
-            // Additional aggressive silencing for very imbalanced signals
-            double total_energy = left_energy + right_energy;
-            if (total_energy > 1e-12) {
-                double left_ratio = left_energy / total_energy;
-                double right_ratio = right_energy / total_energy;
-                
-                // If one channel is >90% dominant, aggressively suppress the other
-                if (right_ratio > 0.9) {
-                    left_raw *= 0.1;  // Reduce left by 20dB
-                }
-                if (left_ratio > 0.9) {
-                    right_raw *= 0.1;  // Reduce right by 20dB  
-                }
-                
-                // If one channel is >95% dominant, almost completely suppress the other
-                if (right_ratio > 0.95) {
-                    left_raw *= 0.03;  // Reduce left by 30dB
-                }
-                if (left_ratio > 0.95) {
-                    right_raw *= 0.03;  // Reduce right by 30dB
-                }
-            }
-
-            if(delay_enabled)
-            {
-                raw_left_output[i] = left_raw;
-                raw_right_output[i] = right_raw;
-            } else {
-                test_lp15k_output[i] = mono_clean;
-                test_lmr_filtered_output[i] = lr_filtered;
-            }
-
+        // Grow work buffers on demand only; reuse across calls to avoid per-call heap churn.
+        if (input_left_buf.size() < available_samples) {
+            input_fm_buf.resize(available_samples);
+            input_left_buf.resize(available_samples);
+            input_right_buf.resize(available_samples);
         }
 
         for(size_t i = 0; i < available_samples; i++) {
-            
-            double left_raw;
-            double right_raw;
+            input_fm_buf[i] = input[i];
+        }
 
-            if(delay_enabled)
-            {
-                left_raw = tanh(raw_left_output[i] * 0.8);
-                right_raw = tanh(raw_right_output[i] * 0.8);
-            } else {
-                // Matrix to stereo channels with proper scaling
-                left_raw = tanh((test_lp15k_output[i] - test_lmr_filtered_output[i]) * 0.5);
-                right_raw = tanh((test_lp15k_output[i] + test_lmr_filtered_output[i]) * 0.5);
+        size_t i_left = 0;
+        size_t i_right = 0;
+
+        // Pure FM-stereo decoder loop:
+        //   mono = LP(mpx)
+        //   lr   = LP(mpx * coherent_38k * stereo_factor)
+        //
+        // The 38 kHz reference is generated by SQUARING the bandpass-filtered
+        // pilot, then removing DC and normalising amplitude — a stateless,
+        // unconditionally-locked frequency doubler. Unlike a PLL, it has no
+        // integrator state that can wind up or slip by 180°, so channel
+        // assignments cannot intermittently swap. (A PLL implementation is
+        // retained in PilotPLL for callers that need an explicit lock metric.)
+        //
+        // Both audio paths run through identical 8th-order Butterworth low-passes
+        // (15 kHz), so their amplitude and group delay match exactly across the
+        // audio band — the key for clean, frequency-independent separation.
+        for(size_t i = 0; i < available_samples; i++) {
+            double mpx_signal = input_fm_buf[i];
+
+            // 19 kHz pilot extraction.
+            double pilot_19k = filter_19k->process(mpx_signal);
+
+            // Maintain a small ring of recent pilot samples for fractional-delay
+            // interpolation of the quadrature pilot.
+            pilot_history[pilot_history_idx] = pilot_19k;
+
+            // Quadrature pilot ≈ pilot delayed by π/2 at 19 kHz. Linear interpolation
+            // between the two integer-delay neighbours gives sub-sample accuracy.
+            size_t i_newer = (pilot_history_idx + PILOT_HISTORY_LEN - quad_delay_int    ) % PILOT_HISTORY_LEN;
+            size_t i_older = (pilot_history_idx + PILOT_HISTORY_LEN - quad_delay_int - 1) % PILOT_HISTORY_LEN;
+            double pilot_q = (1.0 - quad_delay_frac) * pilot_history[i_newer]
+                           + quad_delay_frac        * pilot_history[i_older];
+
+            pilot_history_idx = (pilot_history_idx + 1) % PILOT_HISTORY_LEN;
+
+            // Squaring frequency-doubler:  p² = A²/2 + (A²/2)·cos(2ωt)
+            // pilot_dc_track converges to A²/2, which removes the DC and
+            // normalises amplitude in one division.
+            double pilot_sq = pilot_19k * pilot_19k;
+            pilot_dc_track += pilot_dc_alpha * (pilot_sq - pilot_dc_track);
+
+            double cos_38k = 0.0;
+            double sin_38k = 0.0;
+            if (pilot_dc_track > 1e-12) {
+                // cos(2ωt) from the squared pilot.
+                cos_38k = (pilot_sq - pilot_dc_track) / pilot_dc_track;
+                // sin(2ωt) recovered from the in-phase × quadrature pilot product.
+                // For a standard FCC sin-form pilot p = A·sin(ωt), the π/2-delayed
+                // copy is p_q = -A·cos(ωt), so p · p_q = −(A²/2)·sin(2ωt). The leading
+                // minus reverses the sign of (L−R) and would swap channels — we negate
+                // here so a +90° phase setting yields the correct +sin(2ωt) reference.
+                sin_38k = -(pilot_19k * pilot_q) / pilot_dc_track;
             }
 
-            input_left[i_left]    = deemphasisFilter(left_raw, true);
-            input_right[i_right]  = deemphasisFilter(right_raw, false);
+            // Tunable phase: cos(2ωt − θ) = cos(θ)·cos(2ωt) + sin(θ)·sin(2ωt).
+            // Calibrate via setSubcarrierPhase() for your transmitter convention.
+            double coherent_38k = subcarrier_phase_cos * cos_38k
+                                + subcarrier_phase_sin * sin_38k;
 
-            i_left++;
-            i_right++;
+            // Pilot RMS for diagnostics (≈ A / √2).
+            pilot_strength = std::sqrt(pilot_dc_track);
+
+            // Mono and L-R baseband, both filtered by identical 15 kHz LPs.
+            double mono = filter_lp_mono->process(mpx_signal);
+            double lr   = filter_lp_lr  ->process(mpx_signal * coherent_38k * stereo_factor);
+
+            double left_raw  = mono + lr;
+            double right_raw = mono - lr;
+
+            // Slow DC blocker (~3 Hz @ inputSampleRate) — only removes numerical/carrier
+            // bias, doesn't touch audio.
+            left_dc_offset  += balance_alpha * (left_raw  - left_dc_offset);
+            right_dc_offset += balance_alpha * (right_raw - right_dc_offset);
+            left_raw  -= left_dc_offset;
+            right_raw -= right_dc_offset;
+
+            // Soft saturation + 50 µs deemphasis.
+            double left_shaped  = tanh(left_raw  * 0.8);
+            double right_shaped = tanh(right_raw * 0.8);
+
+            input_left_buf [i_left++]  = deemphasisFilter(left_shaped,  true);
+            input_right_buf[i_right++] = deemphasisFilter(right_shaped, false);
         }
 
 #if !TEST_DIRECTFMINPUT
-        state_left = left_decimator.process(denomImmutable, denomState_left, input_left, i_left, writeable_stereo_frames, rate);
-
-        //denomState_right->where = denomState_left->where;  // Keep in sync
-        
-        state_right = right_decimator.process(denomImmutable, denomState_right, input_right, i_right, writeable_stereo_frames, rate);
+        state_left  = left_decimator.process(denomImmutable,  denomState_left,  input_left_buf,  i_left,  writeable_stereo_frames, rate);
+        state_right = right_decimator.process(denomImmutable, denomState_right, input_right_buf, i_right, writeable_stereo_frames, rate);
 
         size_t max_input_consumed = (state_left.input_processed + state_right.input_processed) / 2;
         size_t min_output = state_left.output_processed + state_right.output_processed;
-        
-        /*if (state_left.output_processed != state_right.output_processed) {
-            printf("WARNING: Channel output mismatch! Left=%zu, Right=%zu\n", state_left.output_processed, state_right.output_processed);
-        }*/
 
-        // Interleave output
         for (size_t i = 0; i < min_output / 2; i++) {
-            output[i * 2] = state_left.output[i];
+            output[i * 2]     = state_left.output[i];
             output[i * 2 + 1] = state_right.output[i];
         }
 
-        size_t input_samples_consumed = max_input_consumed;  // Convert frames to samples
-        size_t output_samples_produced = min_output;         // Convert frames to samples
+        size_t input_samples_consumed  = max_input_consumed;
+        size_t output_samples_produced = min_output;
 #else
         size_t max_input_consumed = (i_left + i_right) / 2;
         size_t min_output = i_left + i_right;
 
         for (size_t i = 0; i < i_left; i++) {
-            output[i * 2] = input_left[i];
-            output[i * 2 + 1] = input_right[i];
+            output[i * 2]     = input_left_buf[i];
+            output[i * 2 + 1] = input_right_buf[i];
         }
 
-        size_t input_samples_consumed = max_input_consumed;  // Convert frames to samples
-        size_t output_samples_produced = min_output;         // Convert frames to samples
+        size_t input_samples_consumed  = max_input_consumed;
+        size_t output_samples_produced = min_output;
 #endif
-        //printf("Advancing: reader by %zu samples, writer by %zu samples\n", input_samples_consumed, output_samples_produced);
-        
+
         this->reader->advance(input_samples_consumed);
         this->writer->advance(output_samples_produced);
     }

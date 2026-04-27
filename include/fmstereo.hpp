@@ -228,7 +228,9 @@ namespace Csdr {
 
     class MultistageFilter {
     private:
-        static const int MAX_STAGES = 4;
+        // 12 stages = up to 24th-order Butterworth (more than enough headroom).
+        // For 16th-order the highest required Q is ≈ 5.1 — well inside the clamp below.
+        static const int MAX_STAGES = 12;
         BiquadFilter stages[MAX_STAGES];
         int num_stages;
         
@@ -441,6 +443,25 @@ namespace Csdr {
                     return deemph_state_R;
                 }
             }
+
+            // Calibrates the L-R subcarrier recovery gain at runtime. The default 2.0
+            // assumes a standard FM-stereo MPX where the L-R subcarrier and (L+R) mono
+            // signal share the same modulation index; if your transmitter uses different
+            // coefficients you can fine-tune this to maximize stereo separation.
+            void setStereoFactor(double factor) { stereo_factor = factor; }
+            double getStereoFactor() const { return stereo_factor; }
+
+            // Phase offset (in degrees) applied to the recovered 38 kHz subcarrier reference.
+            //   0   -> cos(2ωt) — matches transmitters that put the L-R subcarrier in phase
+            //                    with the squared 19 kHz pilot.
+            //   90  -> sin(2ωt) — matches the standard FCC/EBU FM-stereo convention.
+            // Sweep this to maximise channel separation if you don't know your TX's convention.
+            void setSubcarrierPhase(double degrees) {
+                subcarrier_phase_rad = degrees * (M_PI / 180.0);
+                subcarrier_phase_cos = std::cos(subcarrier_phase_rad);
+                subcarrier_phase_sin = std::sin(subcarrier_phase_rad);
+            }
+            double getSubcarrierPhase() const { return subcarrier_phase_rad * (180.0 / M_PI); }
             
             private:
             unsigned int num_poly_points; //number of samples that the Lagrange interpolator will use
@@ -454,59 +475,61 @@ namespace Csdr {
             void initializeFilters();
             bool initializedFilters_ = false;
 
-            BiquadFilter* filter_19k;      // 19kHz pilot tone bandpass
-            NotchFilter* notch_19k;           // 19kHz pilot notch filter
-            NotchFilter* notch_38k;           // 38kHz L-R carrier notch filter
-            BiquadFilter* filter_hp;       // High-pass for DC removal
-            MultistageFilter* filter_lp_lr;    // Low-pass for L-R signal
-            MultistageFilter* filter_lp_mono;  // Low-pass for mono signal
+            BiquadFilter* filter_19k;          // 19kHz pilot tone bandpass (subcarrier reference)
+            MultistageFilter* filter_lp_lr;    // 15kHz LP, 8th order — applied to L-R baseband
+            MultistageFilter* filter_lp_mono;  // 15kHz LP, 8th order — applied to mono baseband
+                                               // (Both share identical coefficients; matched
+                                               //  group delay and magnitude across the audio band.)
+
+            // Pre-allocated work buffers (grown on demand, reused across process() calls)
+            std::vector<double> input_fm_buf;
+            std::vector<T> input_left_buf;
+            std::vector<T> input_right_buf;
+
+            // Runtime-tunable gain to convert recovered L-R baseband back to its original amplitude.
+            // 2.0 is correct for any MPX where (L+R) mono and (L-R) subcarrier share the same
+            // modulation index (the standard case).
+            double stereo_factor;
+
+            // Squaring-based 38 kHz reference generator state.
+            // pilot_dc_track converges to E[p²] = A²/2 for a clean pilot p(t) = A·cos(ωt);
+            // the same value normalises the amplitude back to unity AND removes the DC term.
+            double pilot_dc_track;
+            double pilot_dc_alpha;
+
+            // Quadrature-pilot generation via fractional delay (~2.526 samples @ 192 kHz / 19 kHz).
+            // Lets us synthesise sin(2ωt) in addition to cos(2ωt), and therefore hit any
+            // arbitrary subcarrier phase by mixing them.
+            static const size_t PILOT_HISTORY_LEN = 8;
+            double pilot_history[PILOT_HISTORY_LEN];
+            size_t pilot_history_idx;
+            size_t quad_delay_int;
+            double quad_delay_frac;
+
+            // Cached cos/sin of the user-selected subcarrier phase offset.
+            double subcarrier_phase_rad;
+            double subcarrier_phase_cos;
+            double subcarrier_phase_sin;
 
             // Phase-coherent pilot processing
             PilotPLL* pilot_pll;              // Phase-locked loop for coherent 38kHz generation
 
-            // Stereo presence detection
+            // Pilot lock metric reported by the PLL (kept for diagnostics; no longer gates audio)
             double pilot_strength;
             double stereo_threshold;
 
-            // Deemphasis filter states (50µs time constant)
+            // Forced-stereo flag (always true with the current build; retained for future use)
+            bool signal_present;
+
+            // Deemphasis filter states (50 µs time constant)
             double deemph_tau;
             double deemph_alpha;
             double deemph_state_L;
             double deemph_state_R;
 
-            // Adaptive carrier nulling
-            double carrier_leak_i, carrier_leak_q;  // I/Q carrier leakage compensation
-            double leak_alpha;                       // Adaptation rate
-
-            // Channel balance correction
-            double left_dc_offset, right_dc_offset;   // DC offset tracking
-            double left_gain_correction, right_gain_correction;  // Gain imbalance correction
-            double balance_alpha;                     // Balance adaptation rate
-            double left_energy, right_energy;        // Channel energy tracking
-
-            // Direct crosstalk cancellation
-            double left_to_right_leak, right_to_left_leak;  // Measured crosstalk coefficients
-            double crosstalk_alpha;                   // Crosstalk adaptation rate
-            double left_reference, right_reference;   // Reference signals for crosstalk measurement
-
-            double signal_level;
-            double noise_floor;
-            double gate_threshold;
-            double gate_alpha;
-            bool signal_present;
-
-            // Adaptive L-R gain correction
-            double lr_gain_correction;
-            double lr_gain_alpha;
-            double mono_rms, lr_rms;  // Track signal levels
-
-            // Phase correction and delay compensation
-            bool delay_enabled;
-            static const size_t MAX_DELAY_SAMPLES = 16; // 16
-            double lr_delay_line[MAX_DELAY_SAMPLES];
-            double mono_delay_line[MAX_DELAY_SAMPLES];
-            size_t delay_samples;
-            size_t delay_index;
+            // Slow per-channel DC blocker (~3 Hz @ inputSampleRate)
+            double left_dc_offset, right_dc_offset;
+            double balance_alpha;
 
             // FMDemodMPX STOP
 
