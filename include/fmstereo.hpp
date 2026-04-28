@@ -462,6 +462,38 @@ namespace Csdr {
                 subcarrier_phase_sin = std::sin(subcarrier_phase_rad);
             }
             double getSubcarrierPhase() const { return subcarrier_phase_rad * (180.0 / M_PI); }
+
+            // Pilot envelope smoothing time constant (in seconds). Smaller values track
+            // faster amplitude variations (good for unstable / fading transmitters);
+            // larger values reject more pilot noise. Default = 3 ms, comfortably faster
+            // than any realistic multipath fade rate.
+            void setPilotEnvelopeTimeConstant(double seconds) {
+                if (seconds <= 0.0) return;
+                env_sq_alpha = 1.0 - std::exp(-1.0 / (inputSampleRate * seconds));
+            }
+
+            // Stereo↔mono blend thresholds, expressed in pilot RMS amplitude
+            // (= √env_sq_smoothed, same scale as the MPX input).
+            //   pilot_low_rms  : below this the decoder collapses to mono (no stereo noise)
+            //   pilot_high_rms : above this full stereo is restored
+            //   in between     : linear crossfade
+            // Default initial values are 0.005 .. 0.020 (soft mono fallback enabled).
+            // You can still disable manually by setting both to 0.
+            void setStereoBlendThresholds(double pilot_low_rms, double pilot_high_rms) {
+                blend_low_threshold  = pilot_low_rms;
+                blend_high_threshold = pilot_high_rms;
+            }
+            double getStereoBlendLowThreshold()  const { return blend_low_threshold; }
+            double getStereoBlendHighThreshold() const { return blend_high_threshold; }
+
+            // Quiet-program de-hiss blend (audio-level dependent).
+            // In very quiet passages we partially fold stereo toward mono to suppress
+            // residual L-R noise/hiss. Full stereo is preserved once program level rises.
+            void setQuietBlendThresholds(double audio_low, double audio_high, double min_stereo) {
+                quiet_blend_low = audio_low;
+                quiet_blend_high = audio_high;
+                quiet_blend_min_stereo = min_stereo;
+            }
             
             private:
             unsigned int num_poly_points; //number of samples that the Lagrange interpolator will use
@@ -480,7 +512,6 @@ namespace Csdr {
             MultistageFilter* filter_lp_mono;  // 15kHz LP, 8th order — applied to mono baseband
                                                // (Both share identical coefficients; matched
                                                //  group delay and magnitude across the audio band.)
-
             // Pre-allocated work buffers (grown on demand, reused across process() calls)
             std::vector<double> input_fm_buf;
             std::vector<T> input_left_buf;
@@ -491,11 +522,33 @@ namespace Csdr {
             // modulation index (the standard case).
             double stereo_factor;
 
-            // Squaring-based 38 kHz reference generator state.
-            // pilot_dc_track converges to E[p²] = A²/2 for a clean pilot p(t) = A·cos(ωt);
-            // the same value normalises the amplitude back to unity AND removes the DC term.
-            double pilot_dc_track;
-            double pilot_dc_alpha;
+            // Instantaneous envelope tracker for the analytic pilot pair (pilot, pilot_q).
+            // env_sq_smoothed → A(t)² with a fast (~few-ms) IIR. Used to normalise the
+            // recovered cos(2ωt) and sin(2ωt) references to unit amplitude on a
+            // sample-by-sample basis. Replaces the older slow DC-tracker, which
+            // struggled with amplitude-varying pilots (multipath fading, weak/unstable
+            // transmitters).
+            double env_sq_smoothed;
+            double env_sq_alpha;
+
+            // Optional stereo↔mono blend driven by the smoothed pilot RMS amplitude.
+            //   pilot RMS ≤ blend_low_threshold  → pure mono (lr is muted)
+            //   pilot RMS ≥ blend_high_threshold → full stereo
+            //   in between                       → linear crossfade
+            // Defaults: 0.005 .. 0.020 → blending enabled for weak/unstable pilots.
+            double blend_low_threshold;
+            double blend_high_threshold;
+            double pilot_blend_smoothed;
+            double pilot_blend_alpha;
+
+            // Additional "quiet passage" stereo blend. Uses a smoothed |mono| envelope:
+            // below quiet_blend_low -> keep only quiet_blend_min_stereo of L-R,
+            // above quiet_blend_high -> full L-R, in between linear crossfade.
+            double quiet_audio_env;
+            double quiet_audio_alpha;
+            double quiet_blend_low;
+            double quiet_blend_high;
+            double quiet_blend_min_stereo;
 
             // Quadrature-pilot generation via fractional delay (~2.526 samples @ 192 kHz / 19 kHz).
             // Lets us synthesise sin(2ωt) in addition to cos(2ωt), and therefore hit any
@@ -511,21 +564,23 @@ namespace Csdr {
             double subcarrier_phase_cos;
             double subcarrier_phase_sin;
 
-            // Phase-coherent pilot processing
-            PilotPLL* pilot_pll;              // Phase-locked loop for coherent 38kHz generation
+            // PLL-based pilot reference generator (used for coherent 38 kHz NCO).
+            PilotPLL* pilot_pll;
 
-            // Pilot lock metric reported by the PLL (kept for diagnostics; no longer gates audio)
+            // Pilot RMS diagnostic metric (from the recovered pilot envelope).
             double pilot_strength;
-            double stereo_threshold;
-
-            // Forced-stereo flag (always true with the current build; retained for future use)
-            bool signal_present;
 
             // Deemphasis filter states (50 µs time constant)
             double deemph_tau;
             double deemph_alpha;
             double deemph_state_L;
             double deemph_state_R;
+
+            // Simple de-esser state: split deemphasized audio into low/high bands
+            // with a 1-pole LP, then softly compress only the high band.
+            double deesser_lp_a;
+            double deesser_lp_L;
+            double deesser_lp_R;
 
             // Slow per-channel DC blocker (~3 Hz @ inputSampleRate)
             double left_dc_offset, right_dc_offset;

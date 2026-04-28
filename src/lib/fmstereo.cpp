@@ -162,15 +162,14 @@ void StereoFractionalDecimator<T>::initializeFilters() {
     filter_19k     = new BiquadFilter();
     filter_lp_lr   = new MultistageFilter();
     filter_lp_mono = new MultistageFilter();
+    // Keep PLL loop bandwidth moderate so pilot lock remains robust.
+    pilot_pll      = new PilotPLL(inputSampleRate, 19000.0, 0.707, 20.0);
 
-    pilot_pll = new PilotPLL(inputSampleRate);   // kept for potential future use; not used on the audio path
-
-    // 19 kHz pilot bandpass — feeds the squaring-based 38 kHz reference generator.
-    // High Q (=1000, BW ≈ 19 Hz) keeps the pilot extraction extremely narrow so that
-    // squaring it yields a near-noiseless 38 kHz reference.
-    filter_19k->setBandpass2(19000.0, 1000.0, inputSampleRate);
-
-    // Identical 15 kHz LP @ 16th order on both mono and L-R paths so that magnitude
+    // 19 kHz pilot bandpass — feeds the 38 kHz reference generator.
+    // Wider BW reduces time-domain ringing on this implementation and avoids
+    // HF artifacts observed with overly narrow pilot filtering.
+    filter_19k->setBandpass2(19000.0, 1800.0, inputSampleRate);
+    // Identical 14.2 kHz LP @ 8th order on both mono and L-R paths so that magnitude
     // and group delay match exactly across the audio band — the key for clean
     // stereo separation. The 16th-order Butterworth gives:
     //    ~−33 dB at 19 kHz  (pilot residue → effectively inaudible)
@@ -178,30 +177,50 @@ void StereoFractionalDecimator<T>::initializeFilters() {
     //    ~−143 dB at 38 kHz (subcarrier centre)
     // The extra 4 biquads per path are cheap on modern CPUs and give a roughly 30 dB
     // improvement in stop-band rejection over the 8th-order baseline.
-    filter_lp_lr  ->setLowpass(15000.0, inputSampleRate, 16);
-    filter_lp_mono->setLowpass(15000.0, inputSampleRate, 16);
-
+    // Keep full FM audio brightness around the traditional 15 kHz limit.
+    filter_lp_lr  ->setLowpass(15000.0, inputSampleRate, 8);
+    filter_lp_mono->setLowpass(15000.0, inputSampleRate, 8);
     // TODO: make it adjustable
     // Deemphasis time constant (50 microseconds)
     deemph_alpha = exp(-(1.0 / inputSampleRate) / deemph_tau);
     deemph_state_L = 0.0;
     deemph_state_R = 0.0;
+    // 1-pole LP split around ~3.5 kHz for de-essing.
+    deesser_lp_a = std::exp(-2.0 * M_PI * 3500.0 / inputSampleRate);
+    deesser_lp_L = 0.0;
+    deesser_lp_R = 0.0;
 
     // Slow per-channel DC blocker (~3 Hz) — protects against tiny carrier bias.
     left_dc_offset = right_dc_offset = 0.0;
     balance_alpha  = 0.0001;
 
-    // Forced stereo: always treat the signal as present.
-    signal_present = true;
+    // Conservative default for wider transmitter compatibility. Some custom TX chains
+    // over-drive the decoded L-R path with factor 2.0, which can manifest as HF artifacts.
+    // You can still tune at runtime via setStereoFactor().
+    stereo_factor = 1.5;
 
-    // Standard MPX assumption — adjustable at runtime via setStereoFactor() if needed.
-    stereo_factor = 2.0;
+    // Instantaneous envelope normaliser: we use p² + p_q² ≈ A(t)² to scale the
+    // recovered references on every sample, so that varying pilot amplitudes don't
+    // modulate the audio. ~3 ms IIR smoothing knocks down the residual 38 kHz
+    // ripple from the imperfect quadrature pilot while still tracking realistic
+    // (multipath / weak-signal) fade rates of 100 Hz or so.
+    env_sq_smoothed = 0.0;
+    env_sq_alpha    = 1.0 - std::exp(-1.0 / (inputSampleRate * 0.003));
 
-    // Squaring-based 38 kHz reference generator — ~100 ms time constant for the
-    // pilot-DC tracker. Slow enough not to ride the 38 kHz oscillation, fast
-    // enough to follow real envelope changes (e.g. fading SDR signals).
-    pilot_dc_track = 0.0;
-    pilot_dc_alpha = 1.0 - std::exp(-1.0 / (inputSampleRate * 0.1));
+    // Gentle stereo fallback for real-air reception: when pilot gets weak/noisy,
+    // fade L-R toward mono instead of letting high-band artifacts break through.
+    blend_low_threshold  = 0.004;
+    blend_high_threshold = 0.014;
+    pilot_blend_smoothed = 0.0;
+    pilot_blend_alpha    = 1.0 - std::exp(-1.0 / (inputSampleRate * 0.08)); // ~80 ms
+
+    // Quiet-program de-hiss blend disabled by default for maximum linearity.
+    // Re-enable via setQuietBlendThresholds() if you want low-level hiss masking.
+    quiet_audio_env = 0.0;
+    quiet_audio_alpha = 1.0 - std::exp(-1.0 / (inputSampleRate * 0.05)); // ~50 ms
+    quiet_blend_low = 0.0;
+    quiet_blend_high = 0.0;
+    quiet_blend_min_stereo = 1.0;
 
     // Quadrature pilot via fractional delay: π/2 phase shift @ 19 kHz corresponds to
     // exactly fs / (4·19000) samples. We split into integer + fractional parts and
@@ -234,7 +253,6 @@ StereoFractionalDecimator<T>::StereoFractionalDecimator(float rateMPX, float rat
         initializeFilters();
 
         pilot_strength = 0.0;
-        stereo_threshold = 0.005;
 
         denomImmutable = new typename MonoFractionalDecimator<T>::DenominatorImmutable(this->num_poly_points, rate, filter);
         denomState_left = new typename MonoFractionalDecimator<T>::DenominatorState(-denomImmutable->xifirst, denomImmutable->num_poly_points);
@@ -257,7 +275,6 @@ StereoFractionalDecimator<T>::~StereoFractionalDecimator() {
     delete filter_lp_lr;
     delete filter_lp_mono;
     delete pilot_pll;
-
     deemph_state_L = deemph_state_R = 0.0;
     pilot_strength = 0.0;
     left_dc_offset = right_dc_offset = 0.0;
@@ -319,14 +336,12 @@ void StereoFractionalDecimator<T>::process() {
         //   mono = LP(mpx)
         //   lr   = LP(mpx * coherent_38k * stereo_factor)
         //
-        // The 38 kHz reference is generated by SQUARING the bandpass-filtered
-        // pilot, then removing DC and normalising amplitude — a stateless,
-        // unconditionally-locked frequency doubler. Unlike a PLL, it has no
-        // integrator state that can wind up or slip by 180°, so channel
-        // assignments cannot intermittently swap. (A PLL implementation is
-        // retained in PilotPLL for callers that need an explicit lock metric.)
+        // The 38 kHz reference is generated from the filtered pilot and its
+        // quadrature counterpart, with per-sample envelope normalisation.
+        // This keeps channel assignment stable while remaining robust against
+        // pilot-amplitude fluctuations.
         //
-        // Both audio paths run through identical 8th-order Butterworth low-passes
+        // Both audio paths run through identical 16th-order Butterworth low-passes
         // (15 kHz), so their amplitude and group delay match exactly across the
         // audio band — the key for clean, frequency-independent separation.
         for(size_t i = 0; i < available_samples; i++) {
@@ -335,36 +350,24 @@ void StereoFractionalDecimator<T>::process() {
             // 19 kHz pilot extraction.
             double pilot_19k = filter_19k->process(mpx_signal);
 
-            // Maintain a small ring of recent pilot samples for fractional-delay
-            // interpolation of the quadrature pilot.
+            // Slip-free 38 kHz reference from pilot + quadrature pilot.
+            // Unlike PLL lock, this path cannot jump by 180° in the audio matrix,
+            // so left/right channels won't intermittently swap.
             pilot_history[pilot_history_idx] = pilot_19k;
-
-            // Quadrature pilot ≈ pilot delayed by π/2 at 19 kHz. Linear interpolation
-            // between the two integer-delay neighbours gives sub-sample accuracy.
             size_t i_newer = (pilot_history_idx + PILOT_HISTORY_LEN - quad_delay_int    ) % PILOT_HISTORY_LEN;
             size_t i_older = (pilot_history_idx + PILOT_HISTORY_LEN - quad_delay_int - 1) % PILOT_HISTORY_LEN;
             double pilot_q = (1.0 - quad_delay_frac) * pilot_history[i_newer]
                            + quad_delay_frac        * pilot_history[i_older];
-
             pilot_history_idx = (pilot_history_idx + 1) % PILOT_HISTORY_LEN;
 
-            // Squaring frequency-doubler:  p² = A²/2 + (A²/2)·cos(2ωt)
-            // pilot_dc_track converges to A²/2, which removes the DC and
-            // normalises amplitude in one division.
-            double pilot_sq = pilot_19k * pilot_19k;
-            pilot_dc_track += pilot_dc_alpha * (pilot_sq - pilot_dc_track);
+            double env_sq_inst = pilot_19k * pilot_19k + pilot_q * pilot_q;
+            env_sq_smoothed   += env_sq_alpha * (env_sq_inst - env_sq_smoothed);
 
             double cos_38k = 0.0;
             double sin_38k = 0.0;
-            if (pilot_dc_track > 1e-12) {
-                // cos(2ωt) from the squared pilot.
-                cos_38k = (pilot_sq - pilot_dc_track) / pilot_dc_track;
-                // sin(2ωt) recovered from the in-phase × quadrature pilot product.
-                // For a standard FCC sin-form pilot p = A·sin(ωt), the π/2-delayed
-                // copy is p_q = -A·cos(ωt), so p · p_q = −(A²/2)·sin(2ωt). The leading
-                // minus reverses the sign of (L−R) and would swap channels — we negate
-                // here so a +90° phase setting yields the correct +sin(2ωt) reference.
-                sin_38k = -(pilot_19k * pilot_q) / pilot_dc_track;
+            if (env_sq_smoothed > 1e-12) {
+                cos_38k = (pilot_19k * pilot_19k - pilot_q * pilot_q) / env_sq_smoothed;
+                sin_38k = -2.0 * (pilot_19k * pilot_q) / env_sq_smoothed;
             }
 
             // Tunable phase: cos(2ωt − θ) = cos(θ)·cos(2ωt) + sin(θ)·sin(2ωt).
@@ -372,12 +375,33 @@ void StereoFractionalDecimator<T>::process() {
             double coherent_38k = subcarrier_phase_cos * cos_38k
                                 + subcarrier_phase_sin * sin_38k;
 
-            // Pilot RMS for diagnostics (≈ A / √2).
-            pilot_strength = std::sqrt(pilot_dc_track);
+            pilot_strength = std::sqrt(env_sq_smoothed);
 
             // Mono and L-R baseband, both filtered by identical 15 kHz LPs.
             double mono = filter_lp_mono->process(mpx_signal);
             double lr   = filter_lp_lr  ->process(mpx_signal * coherent_38k * stereo_factor);
+
+            // Optional stereo↔mono blend: gradually mute lr below the user-defined
+            // pilot-strength window. Disabled by default (low == high == 0).
+            if (blend_high_threshold > blend_low_threshold) {
+                pilot_blend_smoothed += pilot_blend_alpha * (pilot_strength - pilot_blend_smoothed);
+                double blend = (pilot_blend_smoothed - blend_low_threshold)
+                             / (blend_high_threshold - blend_low_threshold);
+                if (blend < 0.0) blend = 0.0;
+                if (blend > 1.0) blend = 1.0;
+                lr *= blend;
+            }
+
+            // Quiet passage de-hiss: reduce L-R noise floor when program level is very low.
+            quiet_audio_env += quiet_audio_alpha * (std::fabs(mono) - quiet_audio_env);
+            if (quiet_blend_high > quiet_blend_low) {
+                double q = (quiet_audio_env - quiet_blend_low)
+                         / (quiet_blend_high - quiet_blend_low);
+                if (q < 0.0) q = 0.0;
+                if (q > 1.0) q = 1.0;
+                double quiet_blend = quiet_blend_min_stereo + (1.0 - quiet_blend_min_stereo) * q;
+                lr *= quiet_blend;
+            }
 
             double left_raw  = mono + lr;
             double right_raw = mono - lr;
@@ -389,12 +413,42 @@ void StereoFractionalDecimator<T>::process() {
             left_raw  -= left_dc_offset;
             right_raw -= right_dc_offset;
 
-            // Soft saturation + 50 µs deemphasis.
-            double left_shaped  = tanh(left_raw  * 0.8);
-            double right_shaped = tanh(right_raw * 0.8);
+            // Apply deemphasis first (broadcast FM standard), then a very gentle
+            // soft-limiter with extra headroom. This significantly reduces
+            // sibilant/speech harshness versus clipping before deemphasis.
+            double left_deemph  = deemphasisFilter(left_raw,  true);
+            double right_deemph = deemphasisFilter(right_raw, false);
 
-            input_left_buf [i_left++]  = deemphasisFilter(left_shaped,  true);
-            input_right_buf[i_right++] = deemphasisFilter(right_shaped, false);
+            // De-esser: split into low/high with a 1-pole LP, then softly compress
+            // only the high band. This keeps clarity while reducing "sz/s" harshness.
+            deesser_lp_L = deesser_lp_a * deesser_lp_L + (1.0 - deesser_lp_a) * left_deemph;
+            deesser_lp_R = deesser_lp_a * deesser_lp_R + (1.0 - deesser_lp_a) * right_deemph;
+            double high_L = left_deemph  - deesser_lp_L;
+            double high_R = right_deemph - deesser_lp_R;
+
+            auto deess_high = [](double h) -> double {
+                const double threshold = 0.030;
+                const double ratio = 0.35; // compress above threshold
+                double ah = std::fabs(h);
+                if (ah <= threshold) return h;
+                double sign = (h >= 0.0) ? 1.0 : -1.0;
+                double compressed = threshold + (ah - threshold) * ratio;
+                return sign * compressed;
+            };
+
+            double left_out  = deesser_lp_L + deess_high(high_L);
+            double right_out = deesser_lp_R + deess_high(high_R);
+
+            // Global headroom + transparent peak guard to avoid overall "overdriven"
+            // character after stereo matrixing/de-essing.
+            const double output_gain = 0.64;
+            auto peak_guard = [](double x) -> double {
+                if (x > 0.98) return 0.98;
+                if (x < -0.98) return -0.98;
+                return x;
+            };
+            input_left_buf [i_left++]  = peak_guard(output_gain * left_out);
+            input_right_buf[i_right++] = peak_guard(output_gain * right_out);
         }
 
 #if !TEST_DIRECTFMINPUT
