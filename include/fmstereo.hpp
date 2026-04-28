@@ -79,8 +79,9 @@ namespace Csdr {
             beta_ = 2.0 * damp * wn;     // Proportional gain
             
             double phz = 2.0 * M_PI * pilot_freq / samplerate_;
-            minfreq_ = phz - 2.0 * M_PI * 50.0 / samplerate_;  // ±50 Hz limit
-            maxfreq_ = phz + 2.0 * M_PI * 50.0 / samplerate_;
+            // SDR++-style pilot lock window: 18.75..19.25 kHz (±250 Hz).
+            minfreq_ = phz - 2.0 * M_PI * 250.0 / samplerate_;
+            maxfreq_ = phz + 2.0 * M_PI * 250.0 / samplerate_;
             phzref_ = phz;
             freq_ = phz;
             
@@ -91,40 +92,46 @@ namespace Csdr {
             lockdelay_ = samplerate_ * 0.5;  // 0.5 sec delay for stability
         }
         
-        // Process a single sample from the composite signal.
-        // input: The input sample (bandpassed pilot around 19 kHz).
-        // Returns: The 38 kHz subcarrier sample (cos(2 * phase)) for demodulating (L-R).
-        double process(double input, double& pilot_strength) {
-            // Phase detector: input * sin(phase) ≈ sin(error) for small errors
-            double error = input * std::sin(phase_);
-            
-            // Loop filter: PI control
-            freq_ += alpha_ * error;  // Integrate error to frequency
-            phase_ += freq_ + beta_ * error;  // Update phase with freq + proportional
-            
-            // Wrap phase to [-2π, 2π]
+        // Complex (I/Q) pilot PLL. This mirrors SDR++ behavior better than
+        // the legacy real-only detector and is significantly less prone to
+        // polarity ambiguity under jitter/load.
+        double processIQ(double input_i, double input_q, double& pilot_strength) {
+            double nco_i = std::cos(phase_);
+            double nco_q = std::sin(phase_);
+
+            // error = angle(input * conj(nco))
+            double re = input_i * nco_i + input_q * nco_q;
+            double im = input_q * nco_i - input_i * nco_q;
+            double error = std::atan2(im, re);
+
+            if (error > 0.7) error = 0.7;
+            else if (error < -0.7) error = -0.7;
+
+            freq_ += alpha_ * error;
+            phase_ += freq_ + beta_ * error;
+
             if (phase_ > 2.0 * M_PI) phase_ -= 2.0 * M_PI;
             else if (phase_ < -2.0 * M_PI) phase_ += 2.0 * M_PI;
-            
-            // Clamp frequency
+
             if (freq_ > maxfreq_) freq_ = maxfreq_;
             else if (freq_ < minfreq_) freq_ = minfreq_;
-            
-            // Lock detection
-            double abserr = std::fabs(error);
-            lock_ = lock_ * lockalpha_ + lockbeta_ * abserr;
-            if (lock_ < locklimit_) {
-                lockcount_ = lockdelay_;  // Reset delay counter if low error
+
+            double mag = std::sqrt(input_i * input_i + input_q * input_q);
+            lock_ = lock_ * lockalpha_ + lockbeta_ * std::fabs(error);
+            if (lock_ < locklimit_ && mag > 1e-4) {
+                lockcount_ = lockdelay_;
             }
-            if (lockcount_ > 0) {
-                lockcount_--;
-            }
-            
-            // Set pilot_strength based on lock (1.0 locked, 0.0 unlocked) - adapt as needed
-            pilot_strength = (lockcount_ > 0) ? 1.0 - lock_ : 0.0;
-            
-            // Return doubled phase for 38 kHz subcarrier
+            if (lockcount_ > 0.0) lockcount_--;
+
+            pilot_strength = (lockcount_ > 0.0) ? (1.0 - lock_) : 0.0;
+            if (pilot_strength < 0.0) pilot_strength = 0.0;
+            if (pilot_strength > 1.0) pilot_strength = 1.0;
+
             return std::cos(2.0 * phase_);
+        }
+
+        double process(double input, double& pilot_strength) {
+            return processIQ(input, 0.0, pilot_strength);
         }
         
         void reset() {
@@ -428,6 +435,11 @@ namespace Csdr {
     class StereoFractionalDecimator: public Module<T, T> {
         
         public:
+            enum class StereoDemodMode {
+                SdrPll,
+                AnalyticQuadrature
+            };
+
             StereoFractionalDecimator(float rateMPX, float rate, float tau, unsigned int num_poly_points, FirFilter<T, float>* filter = nullptr);
             ~StereoFractionalDecimator();
             
@@ -494,6 +506,17 @@ namespace Csdr {
                 quiet_blend_high = audio_high;
                 quiet_blend_min_stereo = min_stereo;
             }
+
+            void setDemodMode(StereoDemodMode mode) { demod_mode = mode; }
+            StereoDemodMode getDemodMode() const { return demod_mode; }
+
+            // Fine tune MPX path delay (in input samples) to minimize stereo bleed.
+            // In PLL mode this is often the most sensitive alignment knob.
+            void setMpxAlignDelaySamples(size_t samples) {
+                if (samples >= MPX_ALIGN_MAX_DELAY) samples = MPX_ALIGN_MAX_DELAY - 1;
+                mpx_align_delay_samples = samples;
+            }
+            size_t getMpxAlignDelaySamples() const { return mpx_align_delay_samples; }
             
             private:
             unsigned int num_poly_points; //number of samples that the Lagrange interpolator will use
@@ -559,6 +582,14 @@ namespace Csdr {
             size_t quad_delay_int;
             double quad_delay_frac;
 
+            // Small MPX alignment delay (SDR++-style path matching).
+            // Both mono and L-R branches consume the same delayed MPX sample, which
+            // improves timing consistency against the pilot-derived reference path.
+            static const size_t MPX_ALIGN_MAX_DELAY = 32;
+            double mpx_delay_line[MPX_ALIGN_MAX_DELAY];
+            size_t mpx_delay_index;
+            size_t mpx_align_delay_samples;
+
             // Cached cos/sin of the user-selected subcarrier phase offset.
             double subcarrier_phase_rad;
             double subcarrier_phase_cos;
@@ -566,6 +597,13 @@ namespace Csdr {
 
             // PLL-based pilot reference generator (used for coherent 38 kHz NCO).
             PilotPLL* pilot_pll;
+            // Smoothed polarity tracker between PLL and analytic 38 kHz references.
+            // Keeps PLL path from occasionally settling with inverted stereo polarity.
+            double pll_polarity_metric;
+            double pll_polarity_alpha;
+            int pll_polarity_sign;
+            bool pll_polarity_locked;
+            size_t pll_polarity_lock_samples;
 
             // Pilot RMS diagnostic metric (from the recovered pilot envelope).
             double pilot_strength;
@@ -585,6 +623,8 @@ namespace Csdr {
             // Slow per-channel DC blocker (~3 Hz @ inputSampleRate)
             double left_dc_offset, right_dc_offset;
             double balance_alpha;
+
+            StereoDemodMode demod_mode;
 
             // FMDemodMPX STOP
 
