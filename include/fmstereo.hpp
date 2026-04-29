@@ -364,14 +364,14 @@ namespace Csdr {
                 size_t readerAvailable;
                 size_t writterAvailable;
 
-                float where;
+                double where;
                 size_t output_processed;
                 unsigned int num_poly_points; //number of samples that the Lagrange interpolator will use
                 std::vector<float> poly_precalc_denomiator; //while we don't precalculate coefficients here as in a Farrow structure, because it is a fractional interpolator, but we rather precaculate part of the interpolator expression
                 std::vector<float> coeffs_buf;
                 int xifirst;
                 int xilast;
-                float rate;
+                double rate;
             };
 
             struct DenominatorImmutable {
@@ -379,11 +379,11 @@ namespace Csdr {
                 std::vector<float> poly_precalc_denomiator;
                 int xifirst;
                 int xilast;
-                float rate;
+                double rate;
 
                 FirFilter<T, float>* filter;
 
-                DenominatorImmutable(unsigned int n, float r, FirFilter<T, float>* f) 
+                DenominatorImmutable(unsigned int n, double r, FirFilter<T, float>* f) 
                     : num_poly_points(n & ~1), rate(r), filter(f)
                 {
                     xifirst = -(num_poly_points / 2) + 1;
@@ -400,7 +400,7 @@ namespace Csdr {
             };
 
             struct DenominatorState {
-                float where; // szál-specifikus állapot
+                double where; // szál-specifikus állapot
                 size_t output_processed;
                 std::vector<float> coeffs_buf;
 
@@ -422,10 +422,10 @@ namespace Csdr {
                 ProcessState() : input_processed(0), output_processed(0) {}
             };
 
-            Denominator calculateDenominator(float rate, unsigned int num_poly_points, FirFilter<T, float>* filter = nullptr);
-            bool canProcess(DenominatorImmutable* denom, DenominatorState* denomState, size_t readerAvailable, size_t writterAvailable, float rate);
+            Denominator calculateDenominator(double rate, unsigned int num_poly_points, FirFilter<T, float>* filter = nullptr);
+            bool canProcess(DenominatorImmutable* denom, DenominatorState* denomState, size_t readerAvailable, size_t writterAvailable, double rate);
 
-            ProcessState process(DenominatorImmutable* denom, DenominatorState* denomState, std::vector<T> input, size_t readerAvailable, size_t writerWriteable, float rate);
+            ProcessState process(DenominatorImmutable* denom, DenominatorState* denomState, const std::vector<T>& input, size_t readerAvailable, size_t writerWriteable, double rate);
 
         private:
 

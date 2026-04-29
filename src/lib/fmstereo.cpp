@@ -47,7 +47,7 @@ MonoFractionalDecimator<T>::MonoFractionalDecimator() {
 }
 
 template <typename T>
-typename MonoFractionalDecimator<T>::Denominator MonoFractionalDecimator<T>::calculateDenominator(float rate, unsigned int num_poly_points, FirFilter<T, float> *filter) {
+typename MonoFractionalDecimator<T>::Denominator MonoFractionalDecimator<T>::calculateDenominator(double rate, unsigned int num_poly_points, FirFilter<T, float> *filter) {
 
     Denominator denom;
 
@@ -78,14 +78,14 @@ MonoFractionalDecimator<T>::~MonoFractionalDecimator() {
 }
 
 template <typename T>
-bool MonoFractionalDecimator<T>::canProcess(DenominatorImmutable* denomImmutable, DenominatorState* denomState, size_t readerAvailable, size_t writterAvailable, float rate) {   
-    size_t size = std::min(readerAvailable, (size_t) ceilf((writterAvailable) / rate));
+bool MonoFractionalDecimator<T>::canProcess(DenominatorImmutable* denomImmutable, DenominatorState* denomState, size_t readerAvailable, size_t writterAvailable, double rate) {   
+    size_t size = std::min(readerAvailable, (size_t) std::ceil((writterAvailable) / rate));
     size_t filterLen = denomImmutable->filter != nullptr ? denomImmutable->filter->getOverhead() : 0;
     return ceilf(denomState->where) + denomImmutable->num_poly_points + filterLen < size;
 }
 
 template <typename T>
-typename MonoFractionalDecimator<T>::ProcessState MonoFractionalDecimator<T>::process(DenominatorImmutable* denom, DenominatorState* denomState, std::vector<T> input, size_t readerAvailable, size_t writerWriteable, float rate) {
+typename MonoFractionalDecimator<T>::ProcessState MonoFractionalDecimator<T>::process(DenominatorImmutable* denom, DenominatorState* denomState, const std::vector<T>& input, size_t readerAvailable, size_t writerWriteable, double rate) {
     
     if (!denom || !denomState) {
         printf("MonoFractionalDecimator::ProcessState::process - Denominators not available!\n");
@@ -97,10 +97,10 @@ typename MonoFractionalDecimator<T>::ProcessState MonoFractionalDecimator<T>::pr
 
     int oi = 0;
     int index_high, index;
-    size_t size = std::min(readerAvailable, (size_t) ceilf(writerWriteable / rate));
+    size_t size = std::min(readerAvailable, (size_t) std::ceil(writerWriteable / rate));
     size_t filterLen = denom->filter != nullptr ? denom->filter->getOverhead() : 0;
 
-    int ceil_val = static_cast<int>(ceilf(denomState->where));
+    int ceil_val = static_cast<int>(std::ceil(denomState->where));
     index_high = ceil_val;
 
     int num_poly = denom->num_poly_points;
@@ -110,7 +110,7 @@ typename MonoFractionalDecimator<T>::ProcessState MonoFractionalDecimator<T>::pr
         index = index_high - 1;
 
         int id = 0;
-        float xwhere = denomState->where - index;
+        double xwhere = denomState->where - index;
         for (int xi = denom->xifirst; xi <= denom->xilast; xi++) {
             denomState->coeffs_buf[id] = 1;
             for (int xj = denom->xifirst; xj <= denom->xilast; xj++) {
@@ -121,8 +121,9 @@ typename MonoFractionalDecimator<T>::ProcessState MonoFractionalDecimator<T>::pr
         
         T acc = T(0);
         if (denom->filter != nullptr) {
+            T* input_ptr = const_cast<T*>(input.data());
             for (int i = 0; i < denom->num_poly_points; i++) {
-                SparseView<float> sparse = denom->filter->sparse(input.data());
+                SparseView<float> sparse = denom->filter->sparse(input_ptr);
                 acc += (denomState->coeffs_buf[i] / denom->poly_precalc_denomiator[i]) * sparse[index + i];
             }
         } else {
@@ -134,7 +135,7 @@ typename MonoFractionalDecimator<T>::ProcessState MonoFractionalDecimator<T>::pr
         state.output[oi++] = acc;
         denomState->where += rate;
 
-        ceil_val = static_cast<int>(ceilf(denomState->where));
+        ceil_val = static_cast<int>(std::ceil(denomState->where));
         index_high = ceil_val;
 
         num_poly = denom->num_poly_points;
@@ -393,16 +394,8 @@ void StereoFractionalDecimator<T>::process() {
         }
 
 #if !TEST_DIRECTFMINPUT
-        float synced_where_before = std::min(denomState_left->where, denomState_right->where);
-        denomState_left->where = synced_where_before;
-        denomState_right->where = synced_where_before;
-
         state_left  = left_decimator.process(denomImmutable,  denomState_left,  input_left_buf,  i_left,  writeable_output_frames, rate);
         state_right = right_decimator.process(denomImmutable, denomState_right, input_right_buf, i_right, writeable_output_frames, rate);
-
-        float synced_where_after = std::min(denomState_left->where, denomState_right->where);
-        denomState_left->where = synced_where_after;
-        denomState_right->where = synced_where_after;
 
         size_t synced_input_consumed = std::min(state_left.input_processed, state_right.input_processed);
         size_t synced_output_frames  = std::min(state_left.output_processed, state_right.output_processed);
