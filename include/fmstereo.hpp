@@ -544,6 +544,10 @@ namespace Csdr {
             // 2.0 is correct for any MPX where (L+R) mono and (L-R) subcarrier share the same
             // modulation index (the standard case).
             double stereo_factor;
+            // Slow automatic trim on top of stereo_factor (user knob). Effective L-R gain is
+            // stereo_factor * stereo_factor_auto.
+            double stereo_factor_auto;
+            double stereo_factor_auto_alpha;
 
             // Instantaneous envelope tracker for the analytic pilot pair (pilot, pilot_q).
             // env_sq_smoothed → A(t)² with a fast (~few-ms) IIR. Used to normalise the

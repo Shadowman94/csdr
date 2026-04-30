@@ -175,7 +175,9 @@ void StereoFractionalDecimator<T>::initializeFilters() {
     left_dc_offset = right_dc_offset = 0.0;
     balance_alpha  = 0.0001;
 
-    stereo_factor = 2.0;
+    stereo_factor = 1.5;
+    stereo_factor_auto = 1.0;
+    stereo_factor_auto_alpha = 1.0 - std::exp(-1.0 / (inputSampleRate * 0.15));
     demod_mode = StereoDemodMode::SdrPll;
 
     env_sq_smoothed = 0.0;
@@ -344,7 +346,21 @@ void StereoFractionalDecimator<T>::process() {
             }
 
             double mono = filter_lp_mono->process(mpx_aligned);
-            double lr   = filter_lp_lr  ->process(mpx_aligned * coherent_38k_shifted * stereo_factor);
+
+            double p = pilot_strength;
+            if (p < 0.0) p = 0.0;
+            if (p > 1.0) p = 1.0;
+            double target_auto = 1.15 + (1.55 - 1.15) * p;
+            double mono_abs = std::fabs(mono);
+            if (mono_abs < 0.02) {
+                target_auto *= 0.85;
+            }
+            stereo_factor_auto += stereo_factor_auto_alpha * (target_auto - stereo_factor_auto);
+            if (stereo_factor_auto < 1.10) stereo_factor_auto = 1.10;
+            if (stereo_factor_auto > 1.70) stereo_factor_auto = 1.70;
+
+            const double effective_stereo_gain = stereo_factor * stereo_factor_auto;
+            double lr   = filter_lp_lr  ->process(mpx_aligned * coherent_38k_shifted * effective_stereo_gain);
             if (blend_high_threshold > blend_low_threshold) {
                 const double hard_mono_pilot = 0.002;
                 if (pilot_strength < hard_mono_pilot) {
