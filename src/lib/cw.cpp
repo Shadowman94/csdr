@@ -38,13 +38,13 @@ using namespace Csdr;
 template <typename T>
 const char CwDecoder<T>::cwTable[] =
     "__TEMNAIOGKDWRUS" // 00000000
-    "__QZYCXBJP_L_FVH"
-    "09_8_<_7_(___/-6" // <AR>
-    "1______&2___3_45"
+    "__QZYCXBJP_L_FVH" // 00010000
+    "09_8___7_(}__/=6" // <CT> is }, <KN> is (, <BT> is =
+    "1____+_&2___3_45" // <AR> is +, <AS> is &
     "_______:____,___" // 01000000
-    "__)_!;________-_"
-    "_'___@____._____"
-    "___?______{_____" // <SK>
+    "__)_!;________-_" // 01010000
+    "_'___@____._____" // 01100000
+    "___?______{_____" // <SK> is {
     "________________" // 10000000
     "________________"
     "________________"
@@ -57,8 +57,8 @@ const char CwDecoder<T>::cwTable[] =
 template <typename T>
 CwDecoder<T>::CwDecoder(unsigned int sampleRate, bool showCw)
 : sampleRate(sampleRate),
-  quTime(5),      // Quantization step (ms)
   nbTime(20),     // Noise blanking width (ms)
+  quTime(5),      // Quantization step (ms)
   dbgTime(0),     // Debug printout period (ms)
   showCw(showCw)  // TRUE: print DITs/DAHs
 {
@@ -112,7 +112,7 @@ void CwDecoder<T>::process() {
 
     // Compute overall magnitude
     for(unsigned int i=0 ; i<quStep ; ++i)
-        magnitude += sample2level(data[i]);
+        magnitude += std::abs(data[i]);
 
     this->reader->advance(quStep);
     magnitude /= quStep;
@@ -123,9 +123,24 @@ void CwDecoder<T>::process() {
         magnitude<(magL+range*0.5)? 0 :
         realState0;
 
-    // Keep track of minimal/maximal magnitude
-    magL += magnitude<magL? (magnitude-magL)*attack :  range*decay;
-    magH += magnitude>magH? (magnitude-magH)*attack : -range*decay;
+    // Keep track of minimal/maximal magnitude, only track peak (magH)
+    // inside the mark, only track floor (magL) inside the space, to
+    // prevent long marks/spaces from dragging these values toward
+    // each other
+    if(filtState0)
+        magH += magnitude>magH? (magnitude-magH)*attack : -range*decay;
+    else
+        magL += magnitude<magL? (magnitude-magL)*attack : range*decay;
+
+    // Never let magH/magL become indistinguishable
+    magnitude = std::max(magH * 0.15, 0.02);
+    if(magH - magL < magnitude)
+    {
+        magnitude /= 2.0;
+        magH = magL = (magH + magL)/2.0;
+        magH = magH + magnitude;
+        magL = std::max(magL - magnitude, 0.0);
+    }
 
     // Process input
     processInternal(realState);
@@ -211,9 +226,6 @@ void CwDecoder<T>::processInternal(bool newState) {
                 // Add a DAH to the code
                 code = (code<<1) | 0;
 
-                // Try computing WPM
-                wpm = (wpm + (int)(3600.0/duration))/2;
-
                 // Print a DAH
                 if(showCw)
                 {
@@ -224,11 +236,17 @@ void CwDecoder<T>::processInternal(bool newState) {
 
             // Keep track of the average DIT duration
             if((duration>20.0) && (duration<0.4*avgDahT))
-                avgDitT += (duration - avgDitT)/4.0;
+            {
+                avgDitT += (duration - avgDitT) / 4.0;
+                wpm = (wpm + (int)(1200.0/avgDitT)) / 2;
+            }
 
             // Keep track of the average DAH duration
             if((duration<500.0) && (duration>2.5*avgDitT))
-                avgDahT += (duration - avgDahT)/4.0;
+            {
+                avgDahT += (duration - avgDahT) / 4.0;
+                wpm = (wpm + (int)(3600.0/avgDahT)) / 2;
+            }
         }
     }
 
@@ -265,7 +283,7 @@ void CwDecoder<T>::printDebug()
     char buf[256];
 
     // Create complete string to print
-    sprintf(buf, "[%d-%d .%ld -%ld _%ldms WPM%d]\n", (int)magL, (int)magH, (int)avgDitT, (int)avgDahT, (int)avgBrkT, wpm);
+    sprintf(buf, "[%d-%d .%d -%d _%dms WPM%d]\n", (int)magL, (int)magH, (int)avgDitT, (int)avgDahT, (int)avgBrkT, wpm);
 
     // Print
     printString(buf);
@@ -280,21 +298,9 @@ void CwDecoder<T>::printString(const char *buf)
     if(this->writer->writeable()>=l)
     {
         // Write data then advance pointer
-        memcpy(this->writer->getWritePointer(), buf, l);
+        std::memcpy(this->writer->getWritePointer(), buf, l);
         this->writer->advance(l);
     }
-}
-
-template <>
-inline double CwDecoder<complex<float>>::sample2level(complex<float> input)
-{
-    return sqrt((input.i() * input.i()) + (input.q() * input.q()));
-}
-
-template<>
-inline double CwDecoder<float>::sample2level(float input)
-{
-    return fabs(input);
 }
 
 namespace Csdr {

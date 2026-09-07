@@ -98,9 +98,11 @@ FaxDecoder<T>::FaxDecoder(unsigned int sampleRate, unsigned int lpm, unsigned in
   tailLines(0),
   iFirOld(0.0),
   qFirOld(0.0),
+  sampleCount(0),
   dbgTime(dbgTime)  // Debug printout period (ms)
 {
     phasingPos = new int[phasingLines];
+    lpm        = lpm > 0? lpm : 120;
     blockSize  = sampleRate * colors * 60 / lpm;
 
     // Incoming filters setup
@@ -137,13 +139,12 @@ void FaxDecoder<T>::process() {
     // If not enough space in the current buffer...
     if(!buf || (curSize+size > maxSize))
     {
-        // Create the new buffer, drop out if failed
+        // Create the new buffer
         unsigned char *newBuf = new unsigned char[curSize+size];
-        if(!newBuf) return;
         // Move current data over and delete the old buffer
         if(buf)
         {
-            memcpy(newBuf, buf, curSize*sizeof(buf[0]));
+            std::memcpy(newBuf, buf, curSize*sizeof(buf[0]));
             delete[] buf;
         }
         // Now using the new buffer
@@ -159,9 +160,12 @@ void FaxDecoder<T>::process() {
     {
         // Read incoming data and apply FIR filters
         double in = sample2double(ptr[j]);
-        double f  = fstep * j;
+        double f  = fstep * sampleCount;
         double iFirOut = filters[0].process(in * cos(f));
         double qFirOut = filters[1].process(in * sin(f));
+
+        // Keep track of sample index
+        if(++sampleCount >= sampleRate) sampleCount -= sampleRate;
 
         // Demodulate
         if(am)
@@ -174,21 +178,23 @@ void FaxDecoder<T>::process() {
         }
         else
         {
+            // Compute signal magnitude
             double mag = sqrt(qFirOut*qFirOut + iFirOut*iFirOut);
-            iFirOut /= mag;
-            qFirOut /= mag;
-
-            if(mag<1.0) buf[curSize++] = 0;
+            // If too weak to demodulate reliably, output silence
+            if(mag<1.0)
+                buf[curSize++] = 0;
             else
             {
+                iFirOut /= mag;
+                qFirOut /= mag;
+
                 double x = asin(qFirOld*iFirOut - iFirOld*qFirOut) * coeff;
                 buf[curSize++] = x<-1.0? 0 : x>1.0? 255 : (int)((x/2.0+0.5)*255.0);
+
+                iFirOld = iFirOut;
+                qFirOld = qFirOut;
             }
         }
-
-        // Save previous values
-        iFirOld = iFirOut;
-        qFirOld = qFirOut;
     }
 
     // Advance input pointer
@@ -496,11 +502,17 @@ int FaxDecoder<T>::decodeImageLine(const unsigned char *buf, unsigned int size, 
         {
             int first = n*c + n*i/width;
             int last  = n*c + n*(i+1)/width;
-            int value = 0;
+            int value;
 
-            for(j=first ; j<last ; ++j) value+=buf[j];
+            if(last <= first)
+                value = buf[first];
+            else
+            {
+                for(j=first, value=0 ; j<last ; ++j) value += buf[j];
+                value /= last - first;
+            }
 
-            image[i*colors + c] = value / (last-first);
+            image[i*colors + c] = value;
         }
     }
 
@@ -517,7 +529,7 @@ void FaxDecoder<T>::skipInput(unsigned int size)
     if(size)
     {
         // Move data
-        for(int j=0 ; j<curSize-size ; ++j) buf[j] = buf[j+size];
+        std::memmove(buf, buf+size, (curSize-size) * sizeof(*buf));
         curSize -= size;
 
         // Update time
@@ -673,7 +685,7 @@ unsigned int FaxDecoder<T>::printBmpEmptyLines(unsigned int lines)
     memset(buf, 0xFF, size);
 
     // Insert end-mark at the start of each empty line
-    memcpy(buf, endMark, sizeof(endMark));
+    std::memcpy(buf, endMark, sizeof(endMark));
 
     // Compute the number of lines we can write
     todo = lines<todo? lines : todo;
@@ -732,7 +744,7 @@ bool FaxDecoder<T>::writeData(const void *buf, unsigned int size)
     if(this->writer->writeable()<size) return(false);
 
     // Write data then advance pointer
-    memcpy(this->writer->getWritePointer(), buf, size);
+    std::memcpy(this->writer->getWritePointer(), buf, size);
     this->writer->advance(size);
 
     // Done

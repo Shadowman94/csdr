@@ -29,13 +29,14 @@ namespace Csdr {
     template <typename T>
     class NoiseFilter: public Filter<T> {
         public:
-            NoiseFilter(size_t fftSize = 1024, size_t wndSize = 16, unsigned int decay = 10, unsigned int attack = 2);
+            NoiseFilter(size_t fftSize = 1024, size_t wndSize = 16);
             ~NoiseFilter() override;
 
             size_t apply(T* input, T* output, size_t size) override;
             size_t getMinProcessingSize() override { return fftSize; }
 
-            void setThreshold(int dBthreshold);
+            void setAttackDecay(float attack, float decay);
+            void setThreshold(float dBthreshold);
 
         protected:
             size_t fftSize;   // Size of the FFT
@@ -54,14 +55,13 @@ namespace Csdr {
             fftwf_complex* inverseOutput;
             fftwf_plan inversePlan;
             fftwf_complex* overlapBuf;
+            float* inputWindow;
+            float* synGain;
+
+            // Process one frame of input
+            size_t processFrame(T *input, T *output, size_t size);
 
             // Convert output complex into a sample
             inline T complex2sample(complex<float> input);
-    };
-
-    class AFNoiseFilter: public NoiseFilter<float> {
-        public:
-            AFNoiseFilter(size_t fftSize = 1024, size_t wndSize = 16, unsigned int decay = 10, unsigned int attack = 2):
-                NoiseFilter<float>(fftSize, wndSize, decay, attack) {}
     };
 }

@@ -71,9 +71,9 @@ namespace Csdr {
             unsigned long startTimeL = 0; // Time LOW signal started (ms)
 
             // DIT / DAH / BREAK timing
-            double avgDitT = 50;          // Average DIT signal duration (ms)
-            double avgDahT = 100;         // Average DAH signal duration (ms)
-            double avgBrkT = 50;          // Average BREAK duration (ms)
+            double avgDitT = 50.0;        // Average DIT signal duration (ms)
+            double avgDahT = 100.0;       // Average DAH signal duration (ms)
+            double avgBrkT = 50.0;        // Average BREAK duration (ms)
 
             // Current CW code
             unsigned int code = 1;        // Currently accumulated CW code or 1
@@ -84,9 +84,6 @@ namespace Csdr {
 
             // Debugging data
             unsigned long lastDebugT = 0; // Time of the last debug printout (ms)
-
-            // Convert input sample into signal level
-            inline double sample2level(T input);
 
             // Get current time in milliseconds
             unsigned long msecs()

@@ -47,7 +47,7 @@ along with csdr.  If not, see <https://www.gnu.org/licenses/>.
 #include "mfrtty.hpp"
 #include "sstv.hpp"
 #include "fax.hpp"
-#include "afc.hpp"
+#include "fftafc.hpp"
 #include "cw.hpp"
 #include "noisefilter.hpp"
 #include "sitorb.hpp"
@@ -171,7 +171,7 @@ CLI::Option* Command::addFifoOption() {
 AgcCommand::AgcCommand(): Command("agc", "Automatic gain control") {
     add_set("-f,--format", format, {"s16", "float", "complex"}, "Data format", true);
     add_set("-p,--profile", profile, {"fast", "slow"}, "AGC profile", true);
-    add_option("-a,--attack", attack, "AGC attack rate (slow: 0.1; fast: 0.01)");
+    add_option("-a,--attack", attack, "AGC attack rate (slow: 0.01; fast: 0.1)");
     add_option("-d,--decay", decay, "AGC decay rate (slow: 0.0001; fast: 0.001)");
     add_option("-t,--hangtime", hangtime, "AGC hang time (slow: 600; fast: 200)");
     add_option("-m,--max", max_gain, "Maximum gain", true);
@@ -550,7 +550,7 @@ SnrSquelchCommand::SnrSquelchCommand(): Command("snrsquelch", "Measure signal-to
 }
 
 void SnrSquelchCommand::processFifoData(std::string data) {
-    squelch->setSquelch(std::stof(data));
+    squelch->setThreshold(std::stof(data));
 }
 
 DeemphasisCommand::DeemphasisCommand(): Command("deemphasis", "Deemphasis for FM applications") {
@@ -758,12 +758,13 @@ ReduceNoiseCommand::ReduceNoiseCommand(): Command("reducenoise", "Reduce noise")
     addFifoOption();
     add_option("-f,--fft_size", fftSize, "Number of FFT bins");
     add_option("-w,--wnd_size", wndSize, "Filter window size");
-    add_option("-a,--attack", attack, "Attack rate in FFTs");
-    add_option("-d,--decay", decay, "Decay rate in FFTs");
+    add_option("-a,--attack", attack, "Attack rate (slow: 0.001, fast: 0.1)");
+    add_option("-d,--decay", decay, "Decay rate (slow: 0.001, fast: 0.1)");
     add_option("-t,--threshold", dBthreshold, "Suppression threshold in dB");
     callback( [this] () {
-        auto filter = new AFNoiseFilter(fftSize, wndSize, decay, attack);
+        auto filter = new NoiseFilter<float>(fftSize, wndSize);
         module = new FilterModule<float>(filter);
+        filter->setAttackDecay(attack, decay);
         filter->setThreshold(dBthreshold);
         runModule(module);
     });
@@ -774,7 +775,7 @@ AfcCommand::AfcCommand(): Command("afc", "Automatic frequency control") {
     add_option("sample_period", samplePeriod, "Sample period (>= 1)");
 
     callback( [this] () {
-        runModule(new Afc(updatePeriod, samplePeriod));
+        runModule(new FftAfc(updatePeriod, samplePeriod));
     });
 }
 

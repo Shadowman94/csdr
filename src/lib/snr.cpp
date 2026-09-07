@@ -41,21 +41,29 @@ using namespace Csdr;
 #define CSDR_FFTW_FLAGS (FFTW_DESTROY_INPUT | FFTW_MEASURE)
 #endif
 
-// Hamming window function
-static inline float hamming(unsigned int x, unsigned int size) {
-    return 0.54 - 0.46 * cos((2.0 * M_PI * x) / (size - 1));
+// Hann window function
+static inline float hann(unsigned int x, unsigned int size) {
+    return 0.5f - 0.5f * std::cos((2.0 * M_PI * x) / size);
 }
 
 template <typename T>
 Snr<T>::Snr(size_t length, size_t fftSize, std::function<void(float)> callback)
 : callback(std::move(callback))
 {
-    this->fftSize = fftSize = fftSize >= 64? fftSize: 64;
-    this->length  = length >= fftSize? length : fftSize;
+    // If no fftSize, default to length, else require minimal fftSize
+    this->fftSize = std::max(fftSize? fftSize : length, (size_t)64);
+    this->length  = std::max(length, fftSize);
+    // This is actually half a window
+    this->wndSize = std::max(fftSize >> 7, (size_t)1);
 
     fftInput  = fftwf_alloc_complex(fftSize);
     fftOutput = fftwf_alloc_complex(fftSize);
     fftPlan   = fftwf_plan_dft_1d(fftSize, fftInput, fftOutput, FFTW_FORWARD, CSDR_FFTW_FLAGS);
+
+    // Precompute input window
+    inputWindow = new float[fftSize];
+    for(size_t i=0; i < fftSize; i++)
+        inputWindow[i] = hann(i, fftSize);
 }
 
 template<typename T>
@@ -63,13 +71,14 @@ Snr<T>::~Snr() {
     fftwf_destroy_plan(fftPlan);
     fftwf_free(fftInput);
     fftwf_free(fftOutput);
+    delete [] inputWindow;
 }
 
 template <typename T>
 bool Snr<T>::canProcess() {
     std::lock_guard<std::mutex> lock(this->processMutex);
     size_t length = this->getLength();
-    return (this->reader->available() > length && this->writer->writeable() > length);
+    return (this->reader->available() >= length && this->writer->writeable() >= length);
 }
 
 template <typename T>
@@ -77,26 +86,42 @@ void Snr<T>::process() {
     std::lock_guard<std::mutex> lock(this->processMutex);
 
     T *input = this->reader->getReadPointer();
-    float avg, snr;
+    double avg, max, snr, v;
     size_t j;
 
     // Copy data into the input buffer
     auto* data = (complex<float>*) fftInput;
     for (j=0 ; j < fftSize ; ++j)
-      data[j] = input[j] * hamming(j, fftSize);
+        data[j] = input[j] * inputWindow[j];
 
     // Calculate FFT on input buffer
     fftwf_execute(fftPlan);
 
-    for (avg=snr=0.0, j=0 ; j < fftSize ; ++j) {
-        float v = fftOutput[j][0]*fftOutput[j][0] + fftOutput[j][1]*fftOutput[j][1];
-        snr  = std::max(v, snr);
-        avg += v;
+    // Compute power, including the average
+    for (j=0, avg=0.0 ; j < fftSize ; ++j) {
+        avg += fftOutput[j][0] = fftOutput[j][0]*fftOutput[j][0] + fftOutput[j][1]*fftOutput[j][1];
     }
 
-    // Compute average and peak power
-    avg = (avg - snr) / (fftSize - 1);
-    snr /= avg;
+    // Compute window peak for the first entry
+    for(j=0, max=0.0 ; j<wndSize ; ++j)
+        max += fftOutput[j][0] + fftOutput[fftSize - j - 1][0];
+
+    // Incrementally compute max / avg by moving window over FFT
+    int prev = fftSize - wndSize;
+    int next = wndSize;
+    for(j=1, v=max ; j<fftSize; ++j) {
+        v += fftOutput[next][0] - fftOutput[prev][0];
+        if(++prev>=fftSize) prev = 0;
+        if(++next>=fftSize) next = 0;
+        max = std::max(v, max);
+    }
+
+    // Keep floor level low, peak level high
+    max   /= wndSize * 2;
+    avg    = (avg - max) / (fftSize - 1);
+    floor += (avg - floor) * (avg > floor? decay : attack);
+    peak  += (max - peak) * (max > peak? attack : decay);
+    snr    = floor > 0.0? peak / floor : 1.0;
 
     // Report peak power over average
     if (callback) callback(snr);
@@ -122,22 +147,27 @@ void Snr<T>::forwardData(T* input, float snr) {
 }
 
 template <typename T>
+void Snr<T>::setAttackDecay(float attack, float decay) {
+    this->attack = std::min(std::max(attack, 0.0001f), 1.0f);
+    this->decay  = std::min(std::max(decay, 0.0001f), 1.0f);
+}
+
+template <typename T>
 SnrSquelch<T>::SnrSquelch(size_t length, size_t fftSize, size_t hangLength, size_t flushLength, std::function<void(float)> callback)
 : Snr<T>(length, fftSize, callback),
   hangLength(hangLength),
-  flushLength(flushLength),
-  callback(std::move(callback))
+  flushLength(flushLength)
 {}
 
 template <typename T>
-void SnrSquelch<T>::setSquelch(float squelchLevel) {
-    this->squelchLevel = squelchLevel;
+void SnrSquelch<T>::setThreshold(float dBthreshold) {
+    this->threshold = std::pow(10.0f, dBthreshold / 10.0f);
 }
 
 template <typename T>
 void SnrSquelch<T>::forwardData(T *input, float snr) {
-//printf("@@@ SNR = %f, SQL = %f\n", snr, squelchLevel);fflush(stdout);
-    if (squelchLevel == 0.0f || snr >= squelchLevel) {
+//fprintf(stderr, "@@@ SNR = %f, SQL = %f\n", snr, threshold);
+    if (threshold == 0.0f || snr >= threshold) {
         Snr<T>::forwardData(input, snr);
         flushCounter = hangCounter = 0;
     } else if (hangCounter < hangLength) {

@@ -18,9 +18,9 @@ along with libcsdr.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 #include "dsc.hpp"
-#include <string.h>
-#include <stdio.h>
-#include <time.h>
+#include <cstring>
+#include <cstdio>
+#include <ctime>
 
 using namespace Csdr;
 
@@ -237,7 +237,7 @@ int DscDecoder::parseMessage(const unsigned char *in, int size) {
     startJson(format);
     if(*src)     outputJson("src", src);
     if(*dst)     outputJson("dst", dst);
-    if(*id)      outputJson("id", loc);
+    if(*id)      outputJson("id", id);
     if(*loc)     outputJson("loc", loc);
     if(*msgt)    outputJson("time", msgt);
     if(*rxfq)    outputJson("rxfreq", rxfq);
@@ -321,7 +321,8 @@ int DscDecoder::parseAddress(char *out, const unsigned char *in, int size) {
             out[i++] = '0' + (in[j] / 10);
             out[i++] = '0' + (in[j] % 10);
         } else {
-            out[i++] = out[i++] = '-';
+            out[i++] = '-';
+            out[i++] = '-';
         }
     }
 
@@ -356,7 +357,7 @@ int DscDecoder::parseLocation(char *out, const unsigned char *in, int size) {
     unsigned int lonM = in[4];
 
     // Verify latitude and longitude
-    if ((latD>180) || (latM>59) || (lonD>90) || (lonM>59)) return 0;
+    if ((latD>90) || (latM>59) || (lonD>180) || (lonM>59)) return 0;
 
     // Print location
     sprintf(out, "%.3f%c%.3f%c",
@@ -388,11 +389,11 @@ int DscDecoder::parseArea(char *out, const unsigned char *in, int size) {
     unsigned int quad = in[0] / 10;
     unsigned int latD = ((in[0] % 10) * 10) + (in[1] / 10);
     unsigned int lonD = ((in[1] % 10) * 100) + in[2];
-    unsigned int latH = in[4];
-    unsigned int lonW = in[5];
+    unsigned int latH = in[3];
+    unsigned int lonW = in[4];
 
     // Verify latitude and longitude
-    if ((latD>180) || (lonD>90)) return 0;
+    if ((latD>90) || (lonD>180)) return 0;
 
     // Print location
     sprintf(out, "%d%c%d%c+%d+%d",
@@ -517,7 +518,8 @@ int DscDecoder::parseFrequency(char *out, const unsigned char *in, int size) {
             // Frequency in 100Hz increments
             for (i=0 ; i<3 ; ++i) {
                 if (in[i] > 99) {
-                    out[j++] = out[j++] = '-';
+                    out[j++] = '-';
+                    out[j++] = '-';
                 } else if ((in[i]>0) || (j>0)) {
                     out[j++] = '0' + in[i] / 10;
                     out[j++] = '0' + in[i] % 10;
@@ -538,7 +540,8 @@ int DscDecoder::parseFrequency(char *out, const unsigned char *in, int size) {
             // Channel number
             for (i=1 ; i<3 ; ++i) {
                 if (in[i] > 99) {
-                    out[j++] = out[j++] = '-';
+                    out[j++] = '-';
+                    out[j++] = '-';
                 } else if ((in[i]>0) || (j>2)) {
                     out[j++] = '0' + in[i] / 10;
                     out[j++] = '0' + in[i] % 10;
@@ -554,7 +557,8 @@ int DscDecoder::parseFrequency(char *out, const unsigned char *in, int size) {
             // Frequency in 10Hz increments
             for (i=1 ; i<4 ; ++i) {
                 if (in[i] > 99) {
-                    out[j++] = out[j++] = '-';
+                    out[j++] = '-';
+                    out[j++] = '-';
                 } else if ((in[i]>0) || (j>0)) {
                     out[j++] = '0' + in[i] / 10;
                     out[j++] = '0' + in[i] % 10;
@@ -570,8 +574,11 @@ int DscDecoder::parseFrequency(char *out, const unsigned char *in, int size) {
 
     // Skip leading zeros
     for (k=0 ; out[k]=='0' ; ++k);
-    if (k>0) {
-        for (j=0 ; out[k] ; ++j, ++k) out[j] = out[k];
+    if (k > 0) {
+        if (!out[k])
+            j = 1;
+        else
+            for (j=0 ; out[k] ; ++j, ++k) out[j] = out[k];
         out[j] = '\0';
     }
 
@@ -587,7 +594,8 @@ int DscDecoder::parseNumber(char *out, const unsigned char *in, int size) {
 
     for (i=0, j=0 ; i<5 ; ++i) {
         if (in[i] > 99) {
-            out[j++] = out[j++] = '-';
+            out[j++] = '-';
+            out[j++] = '-';
         } else if ((in[i]>0) || (j>0)) {
             out[j++] = '0' + in[i] / 10;
             out[j++] = '0' + in[i] % 10;
@@ -613,7 +621,7 @@ int DscDecoder::parsePhone(char *out, const unsigned char *in, int size) {
     out[j++] = in[1]>99? '-' : '0' + in[1] % 10;
 
     // Parse numeric characters
-    for (i=2, j=0 ; (i<size) && (in[i]<100) ; ++i) {
+    for (i=2 ; (i<size) && (in[i]<100) ; ++i) {
         out[j++] = '0' + in[i] / 10;
         out[j++] = '0' + in[i] % 10;
     }
@@ -631,7 +639,7 @@ void DscDecoder::printString(const char *buf) {
     // If there is enough output buffer available...
     if(writer->writeable()>=l) {
         // Write data then advance pointer
-        memcpy(writer->getWritePointer(), buf, l);
+        std::memcpy(writer->getWritePointer(), buf, l);
         writer->advance(l);
     }
 }

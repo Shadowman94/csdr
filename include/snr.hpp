@@ -39,44 +39,52 @@ namespace Csdr {
     template <typename T>
     class Snr: public Module<T, T> {
         public:
-            Snr(size_t length, size_t fftSize = 256, std::function<void(float)> callback = 0);
+            Snr(size_t length, size_t fftSize = 0, std::function<void(float)> callback = 0);
             ~Snr() override;
 
             size_t getLength();
             bool canProcess() override;
             void process() override;
 
+            void setAttackDecay(float attack, float decay);
+
         protected:
             // to be overridden by the squelch implementation
             virtual void forwardData(T* input, float snr);
 
         private:
-            size_t length;
-            size_t fftSize;
+            size_t length;        // Length of data to measure over
+            size_t fftSize;       // Number of FFT bins (<= length)
+            size_t wndSize;       // FFT window width (<= fftSize/2)
+
             std::function<void(float)> callback;
+
+            double attack = 0.3;  // Noise floor and signal peak attack rate
+            double decay  = 0.05; // Noise floor and signal peak decay rate
+            double peak   = 0.0;  // Current signal peak
+            double floor  = 0.0;  // Current noise floor
 
             fftwf_complex* fftInput;
             fftwf_complex* fftOutput;
             fftwf_plan fftPlan;
+            float *inputWindow;
     };
 
     template <typename T>
     class SnrSquelch: public Snr<T> {
         public:
-            SnrSquelch(size_t length, size_t fftSize = 256, size_t hangLength = 0, size_t flushLength = 0, std::function<void(float)> callback = 0);
-            void setSquelch(float squelchLevel);
+            SnrSquelch(size_t length, size_t fftSize = 0, size_t hangLength = 0, size_t flushLength = 0, std::function<void(float)> callback = 0);
+            void setThreshold(float dBthreshold);
 
         protected:
             void forwardData(T* input, float snr) override;
 
         private:
-            std::function<void(float)> callback;
-            size_t length;
-            size_t hangLength;
-            size_t flushLength;
+            size_t hangLength;  // Number of samples to keep after signal stops
+            size_t flushLength; // Number of empty samples after signal stops
 
-            float squelchLevel = 0.0f;
-            size_t hangCounter = 0;
+            float  threshold    = 0.0f; // SNR level that opens squelch
+            size_t hangCounter  = 0;
             size_t flushCounter = 0;
     };
 }
